@@ -13,6 +13,14 @@ except ImportError:
     print("Uwaga: SpeechRecognition nie jest zainstalowany. Używanie prostego rozpoznawania.")
 
 try:
+    import whisper
+    WHISPER_AVAILABLE = True
+    print("✅ OpenAI Whisper dostępny - używanie dla lepszego rozpoznawania polskiej mowy")
+except ImportError:
+    WHISPER_AVAILABLE = False
+    print("Uwaga: OpenAI Whisper nie jest zainstalowany. Używanie Google Speech Recognition.")
+
+try:
     from pydub import AudioSegment
     from pydub.generators import Sine
     PYDUB_AVAILABLE = True
@@ -37,6 +45,7 @@ class CensorshipApp:
         self.input_file = None
         self.output_file = None
         self.word_to_censor = tk.StringVar()
+        self.whisper_model = tk.StringVar(value="small")  # Domyślny model Whisper
         
         self.setup_ui()
         
@@ -93,6 +102,34 @@ class CensorshipApp:
             width=30
         )
         self.word_entry.pack(pady=5, fill='x')
+        
+        # Frame dla wyboru modelu Whisper (tylko jeśli dostępny)
+        if WHISPER_AVAILABLE:
+            model_frame = tk.Frame(self.root, bg='#f0f0f0')
+            model_frame.pack(pady=10, padx=20, fill='x')
+            
+            tk.Label(model_frame, text="Model rozpoznawania mowy:", font=("Arial", 12), bg='#f0f0f0').pack(anchor='w')
+            
+            model_options = ["tiny", "base", "small", "medium", "large"]
+            model_combo = ttk.Combobox(
+                model_frame,
+                textvariable=self.whisper_model,
+                values=model_options,
+                state="readonly",
+                font=("Arial", 10),
+                width=15
+            )
+            model_combo.pack(pady=5, anchor='w')
+            
+            # Informacja o modelach
+            info_text = "tiny/base: szybkie, small: zalecane, medium/large: dokładniejsze ale wolniejsze"
+            tk.Label(
+                model_frame, 
+                text=info_text, 
+                font=("Arial", 9), 
+                bg='#f0f0f0', 
+                fg='#666'
+            ).pack(anchor='w', pady=(2, 0))
         
         # Przycisk cenzury
         self.censor_button = tk.Button(
@@ -293,7 +330,66 @@ class CensorshipApp:
         return temp_wav.name
         
     def transcribe_audio(self, wav_file):
-        """Rozpoznaje mowę w pliku audio"""
+        """Rozpoznaje mowę w pliku audio używając OpenAI Whisper lub Google Speech Recognition"""
+        
+        if WHISPER_AVAILABLE:
+            return self.transcribe_with_whisper(wav_file)
+        elif SPEECH_RECOGNITION_AVAILABLE:
+            return self.transcribe_with_google(wav_file)
+        else:
+            raise Exception("Brak dostępnych bibliotek do rozpoznawania mowy!")
+    
+    def transcribe_with_whisper(self, wav_file):
+        """Rozpoznaje mowę używając OpenAI Whisper"""
+        self.log_message(f"Ładowanie modelu Whisper: {self.whisper_model.get()}")
+        
+        try:
+            model = whisper.load_model(self.whisper_model.get())
+            self.log_message("Model załadowany, rozpoczynanie transkrypcji...")
+            
+            # Whisper automatycznie dzieli audio na segmenty i zwraca timestampy
+            result = model.transcribe(wav_file, language='pl', word_timestamps=True)
+            
+            segments = []
+            
+            # Przetwarzaj segmenty z Whisper
+            for segment in result['segments']:
+                segment_data = {
+                    'start_time': int(segment['start'] * 1000),  # Konwertuj na milisekundy
+                    'end_time': int(segment['end'] * 1000),
+                    'text': segment['text'].lower().strip(),
+                    'words': []  # Dodajemy informacje o pojedynczych słowach
+                }
+                
+                # Jeśli dostępne są timestampy słów, dodaj je
+                if 'words' in segment:
+                    for word_info in segment['words']:
+                        segment_data['words'].append({
+                            'word': word_info['word'].lower().strip(),
+                            'start': int(word_info['start'] * 1000),
+                            'end': int(word_info['end'] * 1000)
+                        })
+                
+                segments.append(segment_data)
+                
+                start_sec = segment['start']
+                end_sec = segment['end']
+                self.log_message(f"Segment {start_sec:.1f}s-{end_sec:.1f}s: {segment['text']}")
+            
+            self.log_message(f"✅ Transkrypcja Whisper zakończona. Znaleziono {len(segments)} segmentów.")
+            return segments
+            
+        except Exception as e:
+            self.log_message(f"❌ Błąd Whisper: {str(e)}")
+            # Fallback do Google Speech Recognition jeśli dostępne
+            if SPEECH_RECOGNITION_AVAILABLE:
+                self.log_message("Próba użycia Google Speech Recognition jako fallback...")
+                return self.transcribe_with_google(wav_file)
+            else:
+                raise e
+    
+    def transcribe_with_google(self, wav_file):
+        """Rozpoznaje mowę używając Google Speech Recognition (oryginalny kod)"""
         r = sr.Recognizer()
         
         # Podziel audio na segmenty (co 30 sekund)
@@ -318,7 +414,7 @@ class CensorshipApp:
                         'start_time': i,
                         'end_time': min(i + segment_length, len(audio)),
                         'text': text.lower(),
-                        'temp_file': temp_segment.name
+                        'words': []  # Google SR nie zwraca timestampów słów
                     })
                     
                     self.log_message(f"Segment {i//1000}s-{min((i + segment_length)//1000, len(audio)//1000)}s: {text}")
@@ -333,7 +429,7 @@ class CensorshipApp:
         return segments
         
     def find_and_censor_word(self, segments, word, wav_file):
-        """Znajduje wystąpienia słowa w segmentach"""
+        """Znajduje wystąpienia słowa w segmentach z ulepszoną dokładnością timestampów"""
         import re
         censored_segments = []
         
@@ -345,29 +441,68 @@ class CensorshipApp:
             matches = list(re.finditer(word_pattern, segment['text'].lower()))
             
             if matches:
-                words = segment['text'].split()
-                segment_duration = segment['end_time'] - segment['start_time']
-                
-                for match in matches:
-                    # Znajdź pozycję słowa w liście słów
-                    text_before_match = segment['text'][:match.start()].lower()
-                    words_before = len(text_before_match.split())
+                # Jeśli mamy timestampy słów z Whisper, użyj ich dla większej dokładności
+                if segment.get('words') and len(segment['words']) > 0:
+                    self.log_message(f"Używanie precyzyjnych timestampów słów z Whisper")
                     
-                    # Oblicz przybliżoną pozycję czasową
-                    if len(words) > 0:
-                        word_start = segment['start_time'] + (words_before / len(words)) * segment_duration
-                        word_end = segment['start_time'] + ((words_before + 1) / len(words)) * segment_duration
-                    else:
-                        word_start = segment['start_time']
-                        word_end = segment['end_time']
+                    for word_info in segment['words']:
+                        # Sprawdź czy to słowo pasuje do wzorca
+                        if re.search(word_pattern, word_info['word'].lower()):
+                            censored_segments.append({
+                                'start': word_info['start'],
+                                'end': word_info['end']
+                            })
+                            
+                            self.log_message(f"✅ Znaleziono precyzyjne dopasowanie '{word_info['word']}' w pozycji {word_info['start']//1000:.1f}s-{word_info['end']//1000:.1f}s")
+                else:
+                    # Fallback do oryginalnej metody dla Google Speech Recognition
+                    self.log_message(f"Używanie przybliżonych timestampów (brak danych o słowach)")
                     
-                    censored_segments.append({
-                        'start': word_start,
-                        'end': word_end
-                    })
+                    words = segment['text'].split()
+                    segment_duration = segment['end_time'] - segment['start_time']
                     
-                    matched_word = match.group()
-                    self.log_message(f"Znaleziono dokładne dopasowanie '{matched_word}' w pozycji {word_start//1000:.1f}s-{word_end//1000:.1f}s")
+                    for match in matches:
+                        # Znajdź pozycję słowa w liście słów
+                        text_before_match = segment['text'][:match.start()].lower()
+                        words_before = len(text_before_match.split())
+                        
+                        # Oblicz przybliżoną pozycję czasową
+                        if len(words) > 0:
+                            word_start = segment['start_time'] + (words_before / len(words)) * segment_duration
+                            word_end = segment['start_time'] + ((words_before + 1) / len(words)) * segment_duration
+                        else:
+                            word_start = segment['start_time']
+                            word_end = segment['end_time']
+                        
+                        censored_segments.append({
+                            'start': word_start,
+                            'end': word_end
+                        })
+                        
+                        matched_word = match.group()
+                        self.log_message(f"⚠️ Znaleziono przybliżone dopasowanie '{matched_word}' w pozycji {word_start//1000:.1f}s-{word_end//1000:.1f}s")
+        
+        # Sortuj segmenty według czasu rozpoczęcia
+        censored_segments.sort(key=lambda x: x['start'])
+        
+        # Usuń nakładające się segmenty
+        if len(censored_segments) > 1:
+            merged_segments = []
+            current = censored_segments[0]
+            
+            for next_segment in censored_segments[1:]:
+                # Jeśli segmenty się nakładają lub są bardzo blisko siebie (mniej niż 100ms)
+                if next_segment['start'] <= current['end'] + 100:
+                    # Połącz segmenty
+                    current['end'] = max(current['end'], next_segment['end'])
+                else:
+                    merged_segments.append(current)
+                    current = next_segment
+            
+            merged_segments.append(current)
+            censored_segments = merged_segments
+            
+            self.log_message(f"Połączono nakładające się segmenty. Finalna liczba: {len(censored_segments)}")
                         
         return censored_segments
         
