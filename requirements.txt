@@ -5,3 +5,5 @@ numpy
 scipy
 pyaudio
 openai-whisper
+python-dotenv
+openai
